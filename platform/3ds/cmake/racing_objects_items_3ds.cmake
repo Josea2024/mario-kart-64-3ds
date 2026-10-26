@@ -406,7 +406,7 @@ s16 add_actor_to_empty_slot(Vec3f pos, Vec3s rot, Vec3f velocity, s16 actorType)
         SPAGHETTIKART_3DS_ACTORS_EXTENDED_TEXT "${SPAGHETTIKART_3DS_ACTORS_EXTENDED_TEXT}")
     string(REPLACE
         "#include \"actors/blue_and_red_shells/update.inc.c\""
-        "#include \"${SPAGHETTIKART_3DS_RED_BLUE_SHELL_SOURCE}\""
+        "#include \"update_red_blue_shell_3ds.inc.c\""
         SPAGHETTIKART_3DS_ACTORS_EXTENDED_TEXT
         "${SPAGHETTIKART_3DS_ACTORS_EXTENDED_TEXT}"
     )

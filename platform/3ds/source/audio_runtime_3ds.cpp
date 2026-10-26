@@ -58,9 +58,8 @@ constexpr uint32_t kStereoSamplesPerGameFrame = kStereoFramesPerGameFrame * 2;
 // transiently overshoot that threshold; the six-wave pool provides capacity
 // without making a third synthesis block part of the normal policy.
 constexpr uint32_t kTargetBufferedFrames = kStereoFramesPerGameFrame * 2;
-constexpr uint32_t kMaxSynthesisBlocksPerPump = 2;
-constexpr size_t kAudioWorkerStackSize = 64u * 1024u;
-constexpr int32_t kAudioWorkerPriority = 0x18;
+constexpr uint32_t kMaxSynthesisBlocksPerPump = 1;
+constexpr size_t kAudioWorkerStackSize = 32u * 1024u;
 
 bool sReady = false;
 bool sGameStateReady = false;
@@ -78,14 +77,9 @@ bool sLoadingAudioBusy = false;
 uint64_t sLastLoadingAudioMs = 0;
 bool sEmptyObservedActive = false;
 Thread sWorkerThread = nullptr;
-LightEvent sWorkerStart;
-LightEvent sWorkerDone;
+LightEvent sAudioWakeEvent;
+std::atomic<bool> sAudioWorkerBusy{ false };
 std::atomic<bool> sWorkerRunning{ false };
-std::atomic<bool> sJobOutstanding{ false };
-std::atomic<bool> sLastJobQueued{ false };
-std::atomic<uint32_t> sLastJobMicroseconds{ 0 };
-std::atomic<uint32_t> sLastJobBlocks{ 0 };
-std::atomic<bool> sRenderWindowOpen{ false };
 std::atomic<bool> sPaused{ false };
 std::atomic<uint16_t> sVolumePercent{ 100 };
 int sWorkerCore = -1;
@@ -224,75 +218,45 @@ void FinishPumpTelemetry(uint32_t bufferedBefore, uint32_t blocksThisPump,
 
 void AudioWorkerMain(void*) {
     while (sWorkerRunning.load(std::memory_order_acquire)) {
-        LightEvent_Wait(&sWorkerStart);
+        LightEvent_Wait(&sAudioWakeEvent);
         if (!sWorkerRunning.load(std::memory_order_acquire)) break;
 
-        // Game logic has already submitted its audio commands. Only this
-        // worker consumes them, and the main thread waits for completion
-        // before beginning the next logic tick, so libultraship's emulated
-        // N64 message queues are never accessed concurrently across ticks.
-        uint32_t blocks = 0;
-        uint32_t synthesisUs = 0;
-        bool queued = true;
-        // The main thread only renders until WaitForWorkerJob closes this
-        // window. Keep feeding NDSP throughout a long render, instead of
-        // returning after one block and starving while the CPU is still busy.
-        do {
-            if (NeedsSynthesis()) {
-                const auto start = mk64_3ds::PerformanceNow();
-                queued = SynthesizeAndQueue(sVolumePercent.load(std::memory_order_relaxed));
-                synthesisUs += static_cast<uint32_t>(mk64_3ds::PerformanceNow() - start);
-                if (!queued) break;
-                ++blocks;
-            } else if (sRenderWindowOpen.load(std::memory_order_acquire)) {
-                // DSP progress wakes the producer; the bounded fallback also
-                // covers suspension or a missed notification. Closing the
-                // render window signals this event, so the logic barrier does
-                // not wait for the next DSP frame or polling interval.
-                Mk64Audio3DSWaitForRefill(10000000ULL);
+        sAudioWorkerBusy.store(true, std::memory_order_release);
+
+        while (sWorkerRunning.load(std::memory_order_acquire) &&
+               !sPaused.load(std::memory_order_relaxed) &&
+               NeedsSynthesis()) {
+            const uint16_t volume = sVolumePercent.load(std::memory_order_relaxed);
+            if (!SynthesizeAndQueue(volume)) {
+                break;
             }
-        } while (sRenderWindowOpen.load(std::memory_order_acquire) &&
-                 sWorkerRunning.load(std::memory_order_acquire));
-        sLastJobBlocks.store(blocks, std::memory_order_relaxed);
-        sLastJobQueued.store(queued, std::memory_order_release);
-        sLastJobMicroseconds.store(synthesisUs, std::memory_order_relaxed);
-        LightEvent_Signal(&sWorkerDone);
+        }
+
+        sAudioWorkerBusy.store(false, std::memory_order_release);
     }
 }
 
 void RestoreCpuLimit() {
     if (sCpuLimitChanged) {
-        // APT cannot restore the initial zero after enabling core 1. E13
-        // silently discarded that error, leaving 80% reserved during HOME.
-        const __3ds_u32 target = std::max<__3ds_u32>(5, sPreviousCpuLimit);
-        const Result result = APT_SetAppCpuTimeLimit(target);
-        __3ds_u32 actual = UINT32_MAX;
-        const Result verified = APT_GetAppCpuTimeLimit(&actual);
-        if (R_SUCCEEDED(result) && R_SUCCEEDED(verified) && actual == target)
-            sCpuLimitChanged = false;
-        char checkpoint[112];
-        snprintf(checkpoint, sizeof(checkpoint), "audio-core1-release-target-%lu-actual-%lu-result-%08lx",
-                 static_cast<unsigned long>(target), static_cast<unsigned long>(actual),
-                 static_cast<unsigned long>(result));
-        Mk64Diagnostics3DSCheckpoint(checkpoint);
+        APT_SetAppCpuTimeLimit(sPreviousCpuLimit);
+        sCpuLimitChanged = false;
     }
 }
 
 // Stop the producer before APT hands DSP/GPU ownership to HOME. Never free
 // its stack or restore the shared-core budget while the thread is alive.
 void StopAudioWorker() {
-    sRenderWindowOpen.store(false, std::memory_order_release);
     sWorkerRunning.store(false, std::memory_order_release);
     Mk64Audio3DSWakeRefill();
     if (sWorkerThread != nullptr) {
-        LightEvent_Signal(&sWorkerStart);
+        LightEvent_Signal(&sAudioWakeEvent);
         if (R_FAILED(threadJoin(sWorkerThread, 500ULL * 1000ULL * 1000ULL))) {
             svcExitProcess();
         }
         threadFree(sWorkerThread);
         sWorkerThread = nullptr;
     }
-    sJobOutstanding.store(false, std::memory_order_release);
+    sAudioWorkerBusy.store(false, std::memory_order_release);
     sWorkerCore = -1;
     RestoreCpuLimit();
 }
@@ -300,70 +264,37 @@ void StopAudioWorker() {
 bool StartAudioWorker() {
     const bool isNewModel = Mk64Graphics3DSResolvedPerformanceProfile() ==
                             MK64_PERFORMANCE_PROFILE_NEW_3DS;
-    sWorkerCore = isNewModel ? 2 : -1;
+    sWorkerCore = isNewModel ? 2 : 1;
 
     if (!isNewModel) {
-        // Physical Old N38 traces spend ~10.5 ms of core 0 per 896-frame block,
-        // a third of the 30 Hz tick. Core 1 is time-sliced with system modules:
-        // a 30% allowance stretches one block past the whole render window, so
-        // request the largest share the system grants. The worker only runs
-        // inside the render window and sleeps otherwise, leaving the remainder
-        // to FS/GSP/DSP. Suspend/exit restore the previous allowance.
         __3ds_u32 currentLimit = 0;
         const bool hadLimit = R_SUCCEEDED(APT_GetAppCpuTimeLimit(&currentLimit));
-        static constexpr std::array<__3ds_u32, 5> kCore1Limits = { 80, 70, 60, 50, 40 };
-        static constexpr __3ds_u32 kMinimumCore1Limit = 40;
-        for (const __3ds_u32 candidate : kCore1Limits) {
-            // The exheader MaxCpu byte caps this request. A physical v2.0 CIA
-            // refused 40-80% silently because its cap was 30%; keep the codes.
-            const Result setResult = APT_SetAppCpuTimeLimit(candidate);
-            if (R_FAILED(setResult)) {
-                char refused[80];
-                snprintf(refused, sizeof(refused), "audio-core1-refused-%lu-result-%08lx",
-                         static_cast<unsigned long>(candidate), static_cast<unsigned long>(setResult));
-                Mk64Diagnostics3DSCheckpoint(refused);
-                continue;
-            }
-            // A successful Set has already changed process state even if the
-            // verification IPC happens to fail. Record it immediately so
-            // every fallback/shutdown path can restore the previous limit.
-            if (!sCpuLimitChanged) sPreviousCpuLimit = hadLimit ? currentLimit : 0;
-            sCpuLimitChanged = sCpuLimitChanged || !hadLimit || candidate != currentLimit;
-            __3ds_u32 actual = candidate;
-            // A successful Set is not proof of a usable share. An installed
-            // CIA in Azahar reported success and then verified at 5%, which
-            // parked synthesis on a starved core 1 and held the game near
-            // 9 FPS while the main thread waited for it. A ~9 ms block only
-            // beats the serialized main-thread path (used by the physical N38
-            // trace) above roughly a one-third share, so require 40%.
-            if (R_SUCCEEDED(APT_GetAppCpuTimeLimit(&actual)) && actual < kMinimumCore1Limit) {
-                char rejected[80];
-                snprintf(rejected, sizeof(rejected), "audio-core1-rejected-%lu-requested-%lu",
-                         static_cast<unsigned long>(actual), static_cast<unsigned long>(candidate));
-                Mk64Diagnostics3DSCheckpoint(rejected);
-                RestoreCpuLimit();
-                continue;
-            }
-            char checkpoint[80];
-            snprintf(checkpoint, sizeof(checkpoint), "audio-core1-limit-%lu-previous-%lu",
-                     static_cast<unsigned long>(actual), static_cast<unsigned long>(sPreviousCpuLimit));
-            Mk64Diagnostics3DSCheckpoint(checkpoint);
-            sWorkerCore = 1;
-            break;
+        if (R_SUCCEEDED(APT_SetAppCpuTimeLimit(30))) {
+            sPreviousCpuLimit = hadLimit ? currentLimit : 0;
+            sCpuLimitChanged = true;
+            Mk64Diagnostics3DSCheckpoint("audio-core1-limit-30");
         }
     }
 
-    if (sWorkerCore < 0) {
-        RestoreCpuLimit();
-        Mk64Diagnostics3DSCheckpoint("audio-worker-sync-fallback");
-        return false;
+    LightEvent_Init(&sAudioWakeEvent, RESET_ONESHOT);
+    sWorkerRunning.store(true, std::memory_order_release);
+    sAudioWorkerBusy.store(false, std::memory_order_release);
+
+    int32_t prio = 0x30;
+    svcGetThreadPriority(&prio, CUR_THREAD_HANDLE);
+    int32_t workerPrio = prio + 1;
+    if (workerPrio < 0x1A) workerPrio = 0x1A;
+    if (workerPrio > 0x3E) workerPrio = 0x3E;
+
+    sWorkerThread = threadCreate(AudioWorkerMain, nullptr, kAudioWorkerStackSize,
+                                 workerPrio, sWorkerCore, false);
+    if (sWorkerThread == nullptr && sWorkerCore != 0) {
+        // Fallback automatically to Core 0 if Core 1 thread creation fails
+        sWorkerCore = 0;
+        sWorkerThread = threadCreate(AudioWorkerMain, nullptr, kAudioWorkerStackSize,
+                                     workerPrio, sWorkerCore, false);
     }
 
-    LightEvent_Init(&sWorkerStart, RESET_ONESHOT);
-    LightEvent_Init(&sWorkerDone, RESET_ONESHOT);
-    sWorkerRunning.store(true, std::memory_order_release);
-    sWorkerThread = threadCreate(AudioWorkerMain, nullptr, kAudioWorkerStackSize,
-                                 kAudioWorkerPriority, sWorkerCore, false);
     if (sWorkerThread == nullptr) {
         sWorkerRunning.store(false, std::memory_order_release);
         sWorkerCore = -1;
@@ -372,52 +303,8 @@ bool StartAudioWorker() {
         return false;
     }
 
-    Mk64Diagnostics3DSCheckpoint(isNewModel ? "audio-worker-core2" : "audio-worker-core1");
+    Mk64Diagnostics3DSCheckpoint(isNewModel ? "audio-worker-core2" : (sWorkerCore == 1 ? "audio-worker-core1" : "audio-worker-core0"));
     return true;
-}
-
-bool ScheduleWorkerJob(bool duringRender = false) {
-    if (!sGameStateReady || sWorkerThread == nullptr || !sWorkerRunning.load(std::memory_order_acquire) ||
-        sPaused.load(std::memory_order_acquire)) {
-        return false;
-    }
-    bool expected = false;
-    if (!sJobOutstanding.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
-        return false;
-    }
-    sVolumePercent.store(Mk64Settings3DSGetMasterVolumePercent(), std::memory_order_relaxed);
-    sLastJobQueued.store(false, std::memory_order_relaxed);
-    sRenderWindowOpen.store(duringRender, std::memory_order_release);
-    LightEvent_Signal(&sWorkerStart);
-    return true;
-}
-
-bool WaitForWorkerJob() {
-    sRenderWindowOpen.store(false, std::memory_order_release);
-    Mk64Audio3DSWakeRefill();
-    if (!sJobOutstanding.load(std::memory_order_acquire)) return true;
-    {
-        mk64_3ds::PerformanceTimer timer(mk64_3ds::PerformanceCurrent().audio_wait_us);
-        const uint64_t started = mk64_3ds::PerformanceNow();
-        uint64_t remainingUs = 2000000;
-        while (LightEvent_WaitTimeout(&sWorkerDone, remainingUs * 1000LL)) {
-            // The timed arbiter can return timeout when the worker signals
-            // between libctru's state check and its syscall, without sleeping.
-            // Consume that completion before treating the result as a failure.
-            if (LightEvent_TryWait(&sWorkerDone)) break;
-            const uint64_t elapsedUs = mk64_3ds::PerformanceNow() - started;
-            if (elapsedUs >= 2000000) {
-                // Never resume logic or free a producer that has not finished.
-                Mk64StartupFailure("audio-worker-barrier-timeout-kernel-exit");
-                svcExitProcess();
-            }
-            remainingUs = 2000000 - elapsedUs;
-        }
-    }
-    mk64_3ds::PerformanceCurrent().audio_synth_us +=
-        sLastJobMicroseconds.load(std::memory_order_relaxed);
-    sJobOutstanding.store(false, std::memory_order_release);
-    return sLastJobQueued.load(std::memory_order_acquire);
 }
 
 }
@@ -436,8 +323,7 @@ extern "C" bool Mk64GameAudio3DSInit() {
         sAudioPrimed = false;
         sEmptyObservedActive = false;
         sPaused.store(false, std::memory_order_relaxed);
-        sJobOutstanding.store(false, std::memory_order_relaxed);
-        sLastJobQueued.store(false, std::memory_order_relaxed);
+        sAudioWorkerBusy.store(false, std::memory_order_relaxed);
         StartAudioWorker();
     }
     return sReady;
@@ -448,23 +334,16 @@ extern "C" void Mk64GameAudio3DSFinishInitialization() {
 }
 
 extern "C" void Mk64GameAudio3DSBeginLogic() {
-    if (!sReady) return;
-    Mk64StartupStage("audio-logic-barrier-enter");
-    WaitForWorkerJob();
-    Mk64StartupStage("audio-logic-barrier-returned");
+    // Zero-wait: logic proceeds without blocking on Core 1
 }
 
 extern "C" void Mk64GameAudio3DSServiceLoading() {
     if (!sLoadingAudio || sLoadingAudioBusy || !sReady || !sGameStateReady ||
-        sSuspended || sPaused.load(std::memory_order_acquire) ||
-        sJobOutstanding.load(std::memory_order_acquire)) return;
+        sSuspended || sPaused.load(std::memory_order_acquire)) return;
     const uint64_t now = osGetTime();
     if (now - sLastLoadingAudioMs < 8) return;
     sLastLoadingAudioMs = now;
     sLoadingAudioBusy = true;
-    // A course/credits load has no player input to delay. Borrow the wave-pool
-    // capacity for ~134 ms, then refill at safe synchronous resource boundaries.
-    // No worker runs alongside track constructors or audio-command producers.
     for (unsigned blocks = 0; blocks < 4 &&
          Mk64Audio3DSBufferedFrames() < kStereoFramesPerGameFrame * 4; ++blocks) {
         if (!SynthesizeAndQueue(Mk64Settings3DSGetMasterVolumePercent())) break;
@@ -475,7 +354,6 @@ extern "C" void Mk64GameAudio3DSServiceLoading() {
 extern "C" void Mk64GameAudio3DSBeginLoading() {
     if (!sReady || !sGameStateReady || sSuspended) return;
     if (sLoadingAudioDepth++) return;
-    WaitForWorkerJob();
     sLoadingAudio = true;
     sLastLoadingAudioMs = osGetTime() - 8;
     Mk64GameAudio3DSServiceLoading();
@@ -490,7 +368,6 @@ extern "C" void Mk64GameAudio3DSEndLoading() {
 extern "C" void Mk64GameAudio3DSSetPaused(bool paused) {
     if (sReady) {
         sPaused.store(paused, std::memory_order_release);
-        if (paused) WaitForWorkerJob();
         Mk64Audio3DSSetPaused(paused);
     }
 }
@@ -510,11 +387,11 @@ extern "C" void Mk64GameAudio3DSResume() {
 }
 
 extern "C" void Mk64GameAudio3DSBeginFrame() {
-    if (!sReady || !sGameStateReady || sSuspended || sPaused.load(std::memory_order_acquire)) return;
-    // Starting immediately before the display-list interpreter overlaps the
-    // expensive mixer with CPU/GPU rendering instead of appending it to the
-    // critical path after every rendered frame.
-    ScheduleWorkerJob(true);
+    if (!sReady || !sGameStateReady || sSuspended || sPaused.load(std::memory_order_relaxed)) return;
+    sVolumePercent.store(Mk64Settings3DSGetMasterVolumePercent(), std::memory_order_relaxed);
+    if (!sAudioWorkerBusy.load(std::memory_order_relaxed) && NeedsSynthesis()) {
+        LightEvent_Signal(&sAudioWakeEvent);
+    }
 }
 
 extern "C" void Mk64GameAudio3DSPump() {
@@ -523,60 +400,30 @@ extern "C" void Mk64GameAudio3DSPump() {
     ++sPumpCallCount;
     const uint32_t bufferedBefore = Mk64Audio3DSBufferedFrames();
     if (sAudioPrimed && bufferedBefore == 0 && !sEmptyObservedActive) {
-        // This is a Pump-time observation, not proof that NDSP remained
-        // empty long enough to produce an audible hardware underrun.
         ++sObservedEmptyTransitionCount;
         sEmptyObservedActive = true;
     } else if (bufferedBefore != 0) {
         sEmptyObservedActive = false;
     }
 
-    const bool jobWasStartedDuringRender = sJobOutstanding.load(std::memory_order_acquire);
-    const bool renderJobQueued = !jobWasStartedDuringRender || WaitForWorkerJob();
-    uint32_t synthesizedThisPump = jobWasStartedDuringRender
-        ? sLastJobBlocks.load(std::memory_order_relaxed) : 0u;
-    if (sPaused.load(std::memory_order_acquire)) {
-        FinishPumpTelemetry(bufferedBefore, synthesizedThisPump, false);
-        return;
-    }
-    if (!renderJobQueued) {
-        ++sQueueFailureCount;
-        FinishPumpTelemetry(bufferedBefore, synthesizedThisPump, true);
+    sVolumePercent.store(Mk64Settings3DSGetMasterVolumePercent(), std::memory_order_relaxed);
+
+    if (sPaused.load(std::memory_order_relaxed)) {
+        FinishPumpTelemetry(bufferedBefore, 0, false);
         return;
     }
 
-    // Refill to a bounded high-water mark, not just one block per visual
-    // iteration. A long course-start frame can consume more than 33 ms of
-    // queued sound; producing the missing blocks here keeps NDSP real-time
-    // while all audio-global access remains complete before the next game
-    // logic tick. At steady 30 Hz this loop still produces exactly one block.
-    bool queueFailedThisPump = false;
-    while (NeedsSynthesis() && synthesizedThisPump < kMaxSynthesisBlocksPerPump) {
-        bool queued = false;
-        // Core 1 on Old 3DS is shared with the OS. A catch-up job has no
-        // rendering left to overlap, so dispatching it there only adds a
-        // scheduling round trip. The previous worker job has completed;
-        // synthesis here remains strictly serialized with game audio state.
-        if (sWorkerCore != 1 && ScheduleWorkerJob()) {
-            queued = WaitForWorkerJob();
-        } else {
-            // Old 3DS systems that cannot reserve core 1 retain the safe
-            // single-threaded path rather than losing audio entirely.
-            mk64_3ds::PerformanceTimer timer(mk64_3ds::PerformanceCurrent().audio_synth_us);
-            queued = SynthesizeAndQueue(Mk64Settings3DSGetMasterVolumePercent());
+    if (sWorkerThread != nullptr) {
+        if (!sAudioWorkerBusy.load(std::memory_order_relaxed) && bufferedBefore < kTargetBufferedFrames) {
+            LightEvent_Signal(&sAudioWakeEvent);
         }
-        // Synthesis advances the game's audio timeline. If NDSP has no
-        // reusable wave, stop immediately so one pressured frame can never
-        // advance and discard several consecutive music/SFX blocks.
-        if (!queued) {
-            ++sQueueFailureCount;
-            queueFailedThisPump = true;
-            break;
+    } else {
+        if (bufferedBefore < kTargetBufferedFrames) {
+            SynthesizeAndQueue(sVolumePercent.load(std::memory_order_relaxed));
         }
-        ++synthesizedThisPump;
     }
-    mk64_3ds::PerformanceCurrent().audio_blocks = synthesizedThisPump;
-    FinishPumpTelemetry(bufferedBefore, synthesizedThisPump, queueFailedThisPump);
+
+    FinishPumpTelemetry(bufferedBefore, 0, false);
 }
 
 extern "C" void Mk64GameAudio3DSShutdown() {
@@ -596,28 +443,19 @@ extern "C" void Mk64GameAudio3DSShutdown() {
     sAudioPrimed = false;
     sEmptyObservedActive = false;
     sPaused.store(false, std::memory_order_relaxed);
-    sJobOutstanding.store(false, std::memory_order_relaxed);
-    sLastJobQueued.store(false, std::memory_order_relaxed);
+    sAudioWorkerBusy.store(false, std::memory_order_relaxed);
 }
 
 extern "C" void Mk64GameAudio3DSAbortForProcessExit() {
     sGameStateReady = false;
-    // aptMainLoop() becoming false means the OS is terminating this process.
-    // During that transition NDSP/service IPC and an outstanding worker can
-    // stop replying, so the normal unbounded teardown is unsafe. Stop issuing
-    // new work and wake the worker, then let _Exit release process-owned
-    // services and memory without waiting on either endpoint.
     sPaused.store(true, std::memory_order_release);
-    sRenderWindowOpen.store(false, std::memory_order_release);
     sWorkerRunning.store(false, std::memory_order_release);
     if (sWorkerThread != nullptr) {
         Mk64Audio3DSWakeRefill();
-        LightEvent_Signal(&sWorkerStart);
+        LightEvent_Signal(&sAudioWakeEvent);
         if (R_SUCCEEDED(threadJoin(sWorkerThread, 250ULL * 1000ULL * 1000ULL))) {
             threadFree(sWorkerThread);
         } else {
-            // The kernel terminates every thread together. A detached producer
-            // could otherwise touch its stack after libctru unmaps the heap.
             svcExitProcess();
         }
         sWorkerThread = nullptr;
